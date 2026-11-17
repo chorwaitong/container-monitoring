@@ -26,7 +26,10 @@ STARTUP_WARMUP_SECONDS = 2.0
 
 # Motion trigger if a huge object (>12% of screen area) passes under top-view camera, within the center 50% of the video.
 MIN_MOTION_AREA_RATIO = 0.12
-CENTER_ZONE_RATIO = 0.50
+# CENTER_ZONE_RATIO = 0.50      # initially aim for the center 50, however it was found the camera not at the right center of the road.
+ZONE_START_RATIO = 0.20         # <--- Left boundary at 20% of width
+ZONE_END_RATIO = 0.70           # <--- Right boundary at 70% of width
+
 # =================================================
 
 # Force RTSP over TCP for reliable streaming without artifacts
@@ -178,10 +181,10 @@ def main():
                 fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
                 contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-                # The middle 50% zone boundaries in inference coordinates
-                margin_x = (1.0 - CENTER_ZONE_RATIO) / 2.0  # 0.25 (25% margin on left/right)
-                zone_x1 = INFERENCE_WIDTH * margin_x
-                zone_x2 = INFERENCE_WIDTH * (1.0 - margin_x)
+                # Approx middle 50% zone boundaries in inference coordinates
+                # margin_x = (1.0 - CENTER_ZONE_RATIO) / 2.0  # 0.25 (25% margin on left/right)
+                zone_x1 = INFERENCE_WIDTH * ZONE_START_RATIO
+                zone_x2 = INFERENCE_WIDTH * ZONE_END_RATIO
 
                 min_pixels = (INFERENCE_WIDTH * inf_h) * MIN_MOTION_AREA_RATIO
                 for cnt in contours:
@@ -268,8 +271,10 @@ def main():
 
         # Draw subtle guide rectangle for the active 50% center detection zone
         prev_h, prev_w = preview.shape[:2]
-        zx1 = int(prev_w * ((1.0 - CENTER_ZONE_RATIO) / 2.0))
-        zx2 = int(prev_w * (1.0 - (1.0 - CENTER_ZONE_RATIO) / 2.0))
+        # zx1 = int(prev_w * ((1.0 - CENTER_ZONE_RATIO) / 2.0))
+        # zx2 = int(prev_w * (1.0 - (1.0 - CENTER_ZONE_RATIO) / 2.0))
+        zx1 = int(prev_w * ZONE_START_RATIO)
+        zx2 = int(prev_w * ZONE_END_RATIO)
         cv2.line(preview, (zx1, 0), (zx1, prev_h), (0, 255, 255), 1)
         cv2.line(preview, (zx2, 0), (zx2, prev_h), (0, 255, 255), 1)
         cv2.putText(preview, "ACTIVE ZONE (50% WIDTH)", (zx1 + 8, 25),
