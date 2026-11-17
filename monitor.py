@@ -1,8 +1,9 @@
 import os
 import time
-import sys
 from datetime import datetime
 import cv2
+import subprocess
+import sys
 import threading
 # from ultralytics import YOLO
 
@@ -13,6 +14,7 @@ if not RTSP_URL:
     print("Please set it before running")
     sys.exit(1)
 
+RTSP_URL_LOW = RTSP_URL.replace("101", "102") if "101" in RTSP_URL else RTSP_URL
 RECORDING_DIR = r"G:\\My Drive\\Projects - Container Monitoring\\Recordings\\"
 
 # Performance & Detection Tuning
@@ -27,17 +29,45 @@ STARTUP_WARMUP_SECONDS = 2.0
 # Motion trigger if a huge object (>12% of screen area) passes under top-view camera, within the center 50% of the video.
 MIN_MOTION_AREA_RATIO = 0.12
 # CENTER_ZONE_RATIO = 0.50      # initially aim for the center 50, however it was found the camera not at the right center of the road.
-ZONE_START_RATIO = 0.20         # <--- Left boundary at 20% of width
+ZONE_START_RATIO = 0.30         # <--- Left boundary at 30% of width
 ZONE_END_RATIO = 0.70           # <--- Right boundary at 70% of width
 
 # =================================================
 
-# Force RTSP over TCP for reliable streaming without artifacts
-# Increase timeout to 10 seconds (in microseconds) and add reorder queue for internet jitter
+def detect_best_hwaccel():
+    """Detects available GPU hardware on Windows to choose the optimal FFmpeg decoder."""
+    try:
+        # Query Windows for available video controllers
+        cmd = "wmic path win32_videocontroller get name"
+        output = subprocess.check_output(cmd, shell=True, timeout=2).decode('utf-8', errors='ignore').lower()
+        
+        if "nvidia" in output:
+            print("[HWACCEL] NVIDIA GPU detected. Using 'cuda' hardware acceleration.")
+            return "cuda"
+        elif "amd" in output or "radeon" in output:
+            print("[HWACCEL] AMD GPU detected. Using 'dxva2' hardware acceleration.")
+            return "dxva2"
+        else:
+            print("[HWACCEL] No discrete GPU found. Falling back to Intel iGPU ('dxva2').")
+            return "dxva2"
+    except Exception as e:
+        print(f"[HWACCEL] Detection failed ({e}). Defaulting to iGPU ('dxva2').")
+        return "dxva2"
+
+# Apply dynamically selected hardware acceleration
+hw_method = detect_best_hwaccel()
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    f"rtsp_transport;tcp|"
+    f"stimeout;10000000|"
+    f"max_delay;500000|"
+    f"hwaccel;{hw_method}"
+)
+
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "rtsp_transport;tcp|"
     "stimeout;10000000|"
-    "max_delay;500000"
+    "max_delay;500000|"
+    "hwaccel;dxva2"  # Offloads 5K decoding from CPU to Intel integrated GPU
 )
 os.makedirs(RECORDING_DIR, exist_ok=True)
 
@@ -68,6 +98,27 @@ class RTSPStream:
                 time.sleep(2)
                 self.cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
                 self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+
+    # Not using this now, but keep it here for future.
+    def switch_stream(self, new_url):
+        """Safely tears down the current stream capture and switches to a new URL."""
+        with self.lock:
+            self.running = False
+        self.thread.join(timeout=2)
+        self.cap.release()
+        
+        # Start new stream connection
+        self.url = new_url
+        self.cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+        self.running = True
+        self.ret, self.frame = self.cap.read()
+        
+        time.sleep(0.2) 
+        self.ret, self.frame = self.cap.read()
+
+        self.thread = threading.Thread(target=self._update, daemon=True)
+        self.thread.start()
 
     def read(self):
         with self.lock:
@@ -108,18 +159,23 @@ def main():
     # model = YOLO("yolov8n_openvino_model/", task="detect")  # or "yolov8n.onnx"
     bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=50, detectShadows=False)
 
-    # cap = connect_stream(RTSP_URL)
+    # Probe high-res dimensions once for the VideoWriter
+    print("Probing high-resolution stream dimensions for recording...")
+    temp_cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+    orig_w = int(temp_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(temp_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = temp_cap.get(cv2.CAP_PROP_FPS)
+    temp_cap.release()
+
+    print(f"The FPS obtained from cv2 is {fps}, will fix it to 20 later.")
+    if fps <= 0 or fps > 60:
+        fps = 20.0
+
+    print(f"Monitoring feed to stream: {RTSP_URL}")
     cap = RTSPStream(RTSP_URL)
     if not cap.isOpened():
         print("Error: Unable to connect to RTSP stream. Check network/credentials.")
         return
-
-    # Retrieve original stream properties
-    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0 or fps > 60:
-        fps = 20.0
 
     aspect_ratio = orig_h / orig_w
     inf_h = int(INFERENCE_WIDTH * aspect_ratio)
@@ -215,27 +271,45 @@ def main():
         auto_record = (current_time - last_detection_time) <= POST_BUFFER_SECONDS
         manual_record = current_time <= manual_record_until
         should_record = auto_record or manual_record  
-
+    
         if should_record and not is_recording:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             prefix = "manual" if manual_record else "container"
             filename = os.path.join(RECORDING_DIR, f"{prefix}_{timestamp}.mp4")
-            fourcc = cv2.VideoWriter_fourcc(*"avc1") 
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            # fourcc = cv2.VideoWriter_fourcc(*"avc1") #Use this for vid that can be shared via whatsapp
             video_writer = cv2.VideoWriter(filename, fourcc, fps, (orig_w, orig_h))
+            
             is_recording = True
+            is_recording_timer_active = False
             print(f"[REC START] {filename}")
 
         elif not should_record and is_recording:
             is_recording = False
-            video_writer.release()
-            video_writer = None
+            is_recording_timer_active = False
+            if video_writer is not None:
+                video_writer.release()
+                video_writer = None
             print("[REC SAVED] Clip finalized.")
 
+        # If recording, pull frames from the high-res stream instead of low-res
         if is_recording and video_writer is not None:
-            video_writer.write(frame)
+            # Initialize recording timer tracking if not already present
+            if 'rec_start_clock' not in locals() or not is_recording_timer_active:
+                rec_start_clock = time.time()
+                rec_frames_written = 0
+                is_recording_timer_active = True
 
-        # 3. RENDER LIVE VIEW WITH OVERLAYS
-        display_frame = frame.copy()
+            elapsed_real_time = time.time() - rec_start_clock
+            target_frame_count = int(elapsed_real_time * fps)
+                
+            # Write frames only as fast as real-time pacing allows
+            while rec_frames_written < target_frame_count:
+                video_writer.write(frame)
+                rec_frames_written += 1
+
+        # 3. RENDER LIVE VIEW WITH OVERLAYS (Using low-res frame for UI display)
+        display_frame = frame.copy() # 'frame' here comes from low-res cap
 
         for (x1, y1, x2, y2, conf, label) in last_detections:
             cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
