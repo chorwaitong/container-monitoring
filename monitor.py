@@ -277,7 +277,7 @@ def main():
         zx2 = int(prev_w * ZONE_END_RATIO)
         cv2.line(preview, (zx1, 0), (zx1, prev_h), (0, 255, 255), 1)
         cv2.line(preview, (zx2, 0), (zx2, prev_h), (0, 255, 255), 1)
-        cv2.putText(preview, "ACTIVE ZONE (50% WIDTH)", (zx1 + 8, 25),
+        cv2.putText(preview, "ACTIVE ZONE", (zx1 + 8, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
         cv2.imshow("Container CCTV Monitor", preview)
