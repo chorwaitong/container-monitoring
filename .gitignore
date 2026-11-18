@@ -1,3 +1,4 @@
 yolov8n.pt
 recordings/
 yolov8n_openvino_model/
+ffmpeg.exe

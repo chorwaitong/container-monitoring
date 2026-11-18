@@ -8,13 +8,16 @@ import threading
 # from ultralytics import YOLO
 
 # ================= CONFIGURATION =================
+HIGH_RES  = True
 RTSP_URL = os.environ.get("ContainerMonitorRTSP", "").strip()
 if not RTSP_URL:
     print("Error: Environment variable 'ContainerMonitorRTSP' is not set or is empty.")
     print("Please set it before running")
     sys.exit(1)
 
-RTSP_URL_LOW = RTSP_URL.replace("101", "102") if "101" in RTSP_URL else RTSP_URL
+if not HIGH_RES:
+    RTSP_URL = RTSP_URL.replace("101", "102") if "101" in RTSP_URL else RTSP_URL
+
 RECORDING_DIR = r"G:\\My Drive\\Projects - Container Monitoring\\Recordings\\"
 
 # Performance & Detection Tuning
@@ -23,7 +26,9 @@ INFERENCE_WIDTH = 640         # Downscale width for AI inference (lowers CPU loa
 TARGET_INFERENCE_FPS = 2.0    # Process only 2 frames per second
 POST_BUFFER_SECONDS = 3.0     # Keep recording for N seconds after truck leaves view
 MANUAL_CLIP_SECONDS = 10.0
-TARGET_CLASSES = [5, 6, 7, 8]         # Anything related, just detect
+TARGET_DISPLAY_FPS = 4.0      # Refresh live preview at 4 FPS (every 0.25s)
+DISPLAY_INTERVAL = 1.0 / TARGET_DISPLAY_FPS
+TARGET_CLASSES = [5, 6, 7, 8]         # For YOLO Anything related, just detect
 STARTUP_WARMUP_SECONDS = 2.0
 
 # Motion trigger if a huge object (>12% of screen area) passes under top-view camera, within the center 50% of the video.
@@ -190,6 +195,7 @@ def main():
     is_recording = False
     last_detection_time = 0
     last_inference_time = 0 
+    last_display_time = 0
     manual_record_until = 0
     stream_start_time = time.time()
     last_detections = []
@@ -275,11 +281,29 @@ def main():
         if should_record and not is_recording:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             prefix = "manual" if manual_record else "container"
-            filename = os.path.join(RECORDING_DIR, f"{prefix}_{timestamp}.mp4")
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            filename = os.path.join(RECORDING_DIR, f"{prefix}_{timestamp}.mkv")
+
+            # fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             # fourcc = cv2.VideoWriter_fourcc(*"avc1") #Use this for vid that can be shared via whatsapp
-            video_writer = cv2.VideoWriter(filename, fourcc, fps, (orig_w, orig_h))
+            # video_writer = cv2.VideoWriter(filename, fourcc, fps, (orig_w, orig_h)) #not using this as it introduce heavy CPU usage.
+
+            # Use FFmpeg to copy the raw stream directly to disk without decoding/encoding CPU load
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-rtsp_transport", "tcp",
+                "-fflags", "+flush_packets",
+                "-max_delay", "500000",
+                "-i", RTSP_URL,
+                "-t", str(int(MANUAL_CLIP_SECONDS)),
+                "-c", "copy",  # Direct stream copy: zero CPU decoding/encoding!
+                "-f", "matroska",
+                "-y",
+                filename
+            ]
             
+            # Spawn FFmpeg as a non-blocking background process
+            video_writer = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
             is_recording = True
             is_recording_timer_active = False
             print(f"[REC START] {filename}")
@@ -288,8 +312,14 @@ def main():
             is_recording = False
             is_recording_timer_active = False
             if video_writer is not None:
-                video_writer.release()
+
+                video_writer.terminate()
+                video_writer.wait()
                 video_writer = None
+
+                # # For cv2 video writer.
+                # video_writer.release()
+                # video_writer = None
             print("[REC SAVED] Clip finalized.")
 
         # If recording, pull frames from the high-res stream instead of low-res
@@ -300,61 +330,61 @@ def main():
                 rec_frames_written = 0
                 is_recording_timer_active = True
 
-            elapsed_real_time = time.time() - rec_start_clock
-            target_frame_count = int(elapsed_real_time * fps)
-                
-            # Write frames only as fast as real-time pacing allows
-            while rec_frames_written < target_frame_count:
-                video_writer.write(frame)
-                rec_frames_written += 1
+            # # For cv2 video writer. 
+            # # Write frames only as fast as real-time pacing allows
+            # elapsed_real_time = time.time() - rec_start_clock
+            # target_frame_count = int(elapsed_real_time * fps)
+            # while rec_frames_written < target_frame_count:
+            #     video_writer.write(frame)
+            #     rec_frames_written += 1
 
         # 3. RENDER LIVE VIEW WITH OVERLAYS (Using low-res frame for UI display)
-        display_frame = frame.copy() # 'frame' here comes from low-res cap
+        if (current_time - last_display_time) >= DISPLAY_INTERVAL:
+            last_display_time = current_time
 
-        for (x1, y1, x2, y2, conf, label) in last_detections:
-            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            text = f"{label} ({conf:.0f}% view)"
-            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-            cv2.rectangle(display_frame, (x1, y1 - th - 10), (x1 + tw, y1), (0, 255, 0), -1)
-            cv2.putText(display_frame, text, (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+            display_frame = frame.copy()
 
-        status_text = "STATUS: RECORDING" if is_recording else "STATUS: MONITORING"
-        status_color = (0, 0, 255) if is_recording else (0, 255, 0)
-        cv2.putText(display_frame, status_text, (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, status_color, 2)
+            for (x1, y1, x2, y2, conf, label) in last_detections:
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                text = f"{label} ({conf:.0f}% view)"
+                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                cv2.rectangle(display_frame, (x1, y1 - th - 10), (x1 + tw, y1), (0, 255, 0), -1)
+                cv2.putText(display_frame, text, (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
 
-        if orig_w > 1280:
-            preview = cv2.resize(display_frame, (1280, int(1280 * aspect_ratio)))
-        else:
-            preview = display_frame
+            status_text = "STATUS: RECORDING" if is_recording else "STATUS: MONITORING"
+            status_color = (0, 0, 255) if is_recording else (0, 255, 0)
+            cv2.putText(display_frame, status_text, (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, status_color, 2)
 
-        bx1, by1, bx2, by2 = BTN_RECT
-        if manual_record:
-            remaining = max(0.0, manual_record_until - current_time)
-            btn_color = (0, 0, 200)
-            btn_label = f"REC: {remaining:.1f}s left"
-        else:
-            btn_color = (200, 100, 0)
-            btn_label = "REC 10s CLIP [R]"
+            if orig_w > 1280:
+                preview = cv2.resize(display_frame, (1280, int(1280 * aspect_ratio)))
+            else:
+                preview = display_frame
 
-        cv2.rectangle(preview, (bx1, by1), (bx2, by2), btn_color, -1)
-        cv2.rectangle(preview, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
-        cv2.putText(preview, btn_label, (bx1 + 12, by1 + 27),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            bx1, by1, bx2, by2 = BTN_RECT
+            if manual_record:
+                remaining = max(0.0, manual_record_until - current_time)
+                btn_color = (0, 0, 200)
+                btn_label = f"REC: {remaining:.1f}s left"
+            else:
+                btn_color = (200, 100, 0)
+                btn_label = "REC 10s CLIP [R]"
 
-        # Draw subtle guide rectangle for the active 50% center detection zone
-        prev_h, prev_w = preview.shape[:2]
-        # zx1 = int(prev_w * ((1.0 - CENTER_ZONE_RATIO) / 2.0))
-        # zx2 = int(prev_w * (1.0 - (1.0 - CENTER_ZONE_RATIO) / 2.0))
-        zx1 = int(prev_w * ZONE_START_RATIO)
-        zx2 = int(prev_w * ZONE_END_RATIO)
-        cv2.line(preview, (zx1, 0), (zx1, prev_h), (0, 255, 255), 1)
-        cv2.line(preview, (zx2, 0), (zx2, prev_h), (0, 255, 255), 1)
-        cv2.putText(preview, "ACTIVE ZONE", (zx1 + 8, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            cv2.rectangle(preview, (bx1, by1), (bx2, by2), btn_color, -1)
+            cv2.rectangle(preview, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
+            cv2.putText(preview, btn_label, (bx1 + 12, by1 + 27),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        cv2.imshow("Container CCTV Monitor", preview)
+            prev_h, prev_w = preview.shape[:2]
+            zx1 = int(prev_w * ZONE_START_RATIO)
+            zx2 = int(prev_w * ZONE_END_RATIO)
+            cv2.line(preview, (zx1, 0), (zx1, prev_h), (0, 255, 255), 1)
+            cv2.line(preview, (zx2, 0), (zx2, prev_h), (0, 255, 255), 1)
+            cv2.putText(preview, "ACTIVE ZONE", (zx1 + 8, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+            cv2.imshow("Container CCTV Monitor", preview)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
