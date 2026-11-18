@@ -7,37 +7,47 @@ import sys
 import threading
 # from ultralytics import YOLO
 
-# ================= CONFIGURATION =================
-HIGH_RES  = True
+# ================= INITIAL CHECKING =================
+script_dir = os.path.dirname(os.path.realpath(__file__))
+ffmpeg_path = os.path.join(script_dir, "ffmpeg.exe")
+if not os.path.isfile(ffmpeg_path):
+    print("File ffmpeg.exe does not exist exists in the script's directory, please get it...")
+    sys.exit(1)
+
+RECORDING_DIR = r"G:\\My Drive\\Projects - Container Monitoring\\Recordings\\"
+os.makedirs(RECORDING_DIR, exist_ok=True)
+if not os.path.isdir(RECORDING_DIR):
+    print(f"The recording folder {RECORDING_DIR} doesnt exist nor can be created, please work it out manually...")
+    sys.exit(1)
+
 RTSP_URL = os.environ.get("ContainerMonitorRTSP", "").strip()
 if not RTSP_URL:
     print("Error: Environment variable 'ContainerMonitorRTSP' is not set or is empty.")
-    print("Please set it before running")
+    print("Please set the environment variable before running")
     sys.exit(1)
-
-if not HIGH_RES:
-    RTSP_URL = RTSP_URL.replace("101", "102") if "101" in RTSP_URL else RTSP_URL
-
-RECORDING_DIR = r"G:\\My Drive\\Projects - Container Monitoring\\Recordings\\"
+# ================= CONFIGURATION =================
+HIGH_RES  = True
 
 # Performance & Detection Tuning
-CONFIDENCE_THRESHOLD = 0.2   # Minimum confidence to trigger detection since it is at top view
-INFERENCE_WIDTH = 640         # Downscale width for AI inference (lowers CPU load)
-TARGET_INFERENCE_FPS = 2.0    # Process only 2 frames per second
-POST_BUFFER_SECONDS = 3.0     # Keep recording for N seconds after truck leaves view
+CONFIDENCE_THRESHOLD = 0.2          # Minimum confidence to trigger detection since it is at top view
+INFERENCE_WIDTH = 640               # Downscale width for AI inference (lowers CPU load)
+TARGET_INFERENCE_FPS = 2.0          # Process only 2 frames per second
+POST_BUFFER_SECONDS = 3.0           # Keep recording for N seconds after truck leaves view
 MANUAL_CLIP_SECONDS = 10.0
-TARGET_DISPLAY_FPS = 4.0      # Refresh live preview at 4 FPS (every 0.25s)
+TARGET_DISPLAY_FPS = 4.0            # Refresh live preview at 4 FPS (every 0.25s)
 DISPLAY_INTERVAL = 1.0 / TARGET_DISPLAY_FPS
-TARGET_CLASSES = [5, 6, 7, 8]         # For YOLO Anything related, just detect
+# TARGET_CLASSES = [5, 6, 7, 8]       # For YOLO: Just detect anything related
 STARTUP_WARMUP_SECONDS = 2.0
 
-# Motion trigger if a huge object (>12% of screen area) passes under top-view camera, within the center 50% of the video.
-MIN_MOTION_AREA_RATIO = 0.12
-# CENTER_ZONE_RATIO = 0.50      # initially aim for the center 50, however it was found the camera not at the right center of the road.
-ZONE_START_RATIO = 0.30         # <--- Left boundary at 30% of width
-ZONE_END_RATIO = 0.70           # <--- Right boundary at 70% of width
+MIN_MOTION_AREA_RATIO = 0.2         # Motion trigger if a huge object (>X% of screen area) passes under top-view camera, within the center 50% of the video.
+ZONE_START_RATIO = 0.30             # Left boundary at 30% of width
+ZONE_END_RATIO = 0.70               # Right boundary at 70% of width
 
+if not HIGH_RES:
+    # 101 is high res (5120 x 1440 resolution), whilst the channel 102 is at lower res.
+    RTSP_URL = RTSP_URL.replace("101", "102") if "101" in RTSP_URL else RTSP_URL
 # =================================================
+
 
 def detect_best_hwaccel():
     """Detects available GPU hardware on Windows to choose the optimal FFmpeg decoder."""
@@ -74,7 +84,7 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "max_delay;500000|"
     "hwaccel;dxva2"  # Offloads 5K decoding from CPU to Intel integrated GPU
 )
-os.makedirs(RECORDING_DIR, exist_ok=True)
+
 
 class RTSPStream:
     """Continuously reads frames in a background thread so AI inference never blocks the network stream."""
@@ -243,8 +253,6 @@ def main():
                 fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
                 contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-                # Approx middle 50% zone boundaries in inference coordinates
-                # margin_x = (1.0 - CENTER_ZONE_RATIO) / 2.0  # 0.25 (25% margin on left/right)
                 zone_x1 = INFERENCE_WIDTH * ZONE_START_RATIO
                 zone_x2 = INFERENCE_WIDTH * ZONE_END_RATIO
 
@@ -283,9 +291,10 @@ def main():
             prefix = "manual" if manual_record else "container"
             filename = os.path.join(RECORDING_DIR, f"{prefix}_{timestamp}.mkv")
 
+            # CV2 video writer, a good solution but not using this as it introduce heavy CPU usage.
             # fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             # fourcc = cv2.VideoWriter_fourcc(*"avc1") #Use this for vid that can be shared via whatsapp
-            # video_writer = cv2.VideoWriter(filename, fourcc, fps, (orig_w, orig_h)) #not using this as it introduce heavy CPU usage.
+            # video_writer = cv2.VideoWriter(filename, fourcc, fps, (orig_w, orig_h)) 
 
             # Use FFmpeg to copy the raw stream directly to disk without decoding/encoding CPU load
             ffmpeg_cmd = [
@@ -295,7 +304,7 @@ def main():
                 "-max_delay", "500000",
                 "-i", RTSP_URL,
                 "-t", str(int(MANUAL_CLIP_SECONDS)),
-                "-c", "copy",  # Direct stream copy: zero CPU decoding/encoding!
+                "-c", "copy",  # Direct stream copy for zero CPU decoding/encoding
                 "-f", "matroska",
                 "-y",
                 filename
@@ -305,12 +314,12 @@ def main():
             video_writer = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             is_recording = True
-            is_recording_timer_active = False
+            # is_recording_timer_active = False #For CV2 video writer
             print(f"[REC START] {filename}")
 
         elif not should_record and is_recording:
             is_recording = False
-            is_recording_timer_active = False
+            # is_recording_timer_active = False #For CV2 video writer
             if video_writer is not None:
 
                 video_writer.terminate()
@@ -320,17 +329,19 @@ def main():
                 # # For cv2 video writer.
                 # video_writer.release()
                 # video_writer = None
+
             print("[REC SAVED] Clip finalized.")
 
-        # If recording, pull frames from the high-res stream instead of low-res
         if is_recording and video_writer is not None:
-            # Initialize recording timer tracking if not already present
-            if 'rec_start_clock' not in locals() or not is_recording_timer_active:
-                rec_start_clock = time.time()
-                rec_frames_written = 0
-                is_recording_timer_active = True
-
+            pass
             # # For cv2 video writer. 
+            # # Initialize recording timer tracking if not already present
+            # if 'rec_start_clock' not in locals() or not is_recording_timer_active:
+            #     rec_start_clock = time.time()
+            #     rec_frames_written = 0
+            #     is_recording_timer_active = True
+
+            
             # # Write frames only as fast as real-time pacing allows
             # elapsed_real_time = time.time() - rec_start_clock
             # target_frame_count = int(elapsed_real_time * fps)
