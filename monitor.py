@@ -6,28 +6,11 @@ import subprocess
 import sys
 import threading
 # from ultralytics import YOLO
+from config import SCRIPT_DIR, RECORDING_DIR, RTSP_URL, HIGH_RES, ZONE_START_RATIO, ZONE_END_RATIO, MIN_MOTION_AREA_RATIO
+from checker import check
 
-# ================= INITIAL CHECKING =================
-script_dir = os.path.dirname(os.path.realpath(__file__))
-ffmpeg_path = os.path.join(script_dir, "ffmpeg.exe")
-if not os.path.isfile(ffmpeg_path):
-    print("File ffmpeg.exe does not exist exists in the script's directory, please get it...")
-    sys.exit(1)
 
-RECORDING_DIR = r"G:\\My Drive\\Projects - Container Monitoring\\Recordings\\"
-os.makedirs(RECORDING_DIR, exist_ok=True)
-if not os.path.isdir(RECORDING_DIR):
-    print(f"The recording folder {RECORDING_DIR} doesnt exist nor can be created, please work it out manually...")
-    sys.exit(1)
-
-RTSP_URL = os.environ.get("ContainerMonitorRTSP", "").strip()
-if not RTSP_URL:
-    print("Error: Environment variable 'ContainerMonitorRTSP' is not set or is empty.")
-    print("Please set the environment variable before running")
-    sys.exit(1)
 # ================= CONFIGURATION =================
-HIGH_RES  = True
-
 # Performance & Detection Tuning
 CONFIDENCE_THRESHOLD = 0.2          # Minimum confidence to trigger detection since it is at top view
 INFERENCE_WIDTH = 640               # Downscale width for AI inference (lowers CPU load)
@@ -38,10 +21,6 @@ TARGET_DISPLAY_FPS = 4.0            # Refresh live preview at 4 FPS (every 0.25s
 DISPLAY_INTERVAL = 1.0 / TARGET_DISPLAY_FPS
 # TARGET_CLASSES = [5, 6, 7, 8]       # For YOLO: Just detect anything related
 STARTUP_WARMUP_SECONDS = 2.0
-
-MIN_MOTION_AREA_RATIO = 0.2         # Motion trigger if a huge object (>X% of screen area) passes under top-view camera, within the center 50% of the video.
-ZONE_START_RATIO = 0.30             # Left boundary at 30% of width
-ZONE_END_RATIO = 0.70               # Right boundary at 70% of width
 
 if not HIGH_RES:
     # 101 is high res (5120 x 1440 resolution), whilst the channel 102 is at lower res.
@@ -77,14 +56,6 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     f"max_delay;500000|"
     f"hwaccel;{hw_method}"
 )
-
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-    "rtsp_transport;tcp|"
-    "stimeout;10000000|"
-    "max_delay;500000|"
-    "hwaccel;dxva2"  # Offloads 5K decoding from CPU to Intel integrated GPU
-)
-
 
 class RTSPStream:
     """Continuously reads frames in a background thread so AI inference never blocks the network stream."""
@@ -170,6 +141,10 @@ def on_mouse_click(event, x, y, flags, param):
             manual_trigger_requested = True
 
 def main():
+    if not check():
+        sys.exit(1)
+
+
     # print("Loading lightweight YOLOv8-Nano model...")
     # model = YOLO("yolov8n_openvino_model/", task="detect")  # or "yolov8n.onnx"
     bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=50, detectShadows=False)
